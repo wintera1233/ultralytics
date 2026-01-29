@@ -52,6 +52,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "EMA",
 )
 
 
@@ -208,33 +209,28 @@ class SPP(nn.Module):
 class SPPF(nn.Module):
     """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
 
-    def __init__(self, c1: int, c2: int, k: int = 5, n: int = 3, shortcut: bool = False):
+    def __init__(self, c1: int, c2: int, k: int = 5):
         """Initialize the SPPF layer with given input/output channels and kernel size.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
             k (int): Kernel size.
-            n (int): Number of pooling iterations.
-            shortcut (bool): Whether to use shortcut connection.
 
         Notes:
             This module is equivalent to SPP(k=(5, 9, 13)).
         """
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1, act=False)
-        self.cv2 = Conv(c_ * (n + 1), c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
-        self.n = n
-        self.add = shortcut and c1 == c2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply sequential pooling operations to input and return concatenated feature maps."""
         y = [self.cv1(x)]
-        y.extend(self.m(y[-1]) for _ in range(getattr(self, "n", 3)))
-        y = self.cv2(torch.cat(y, 1))
-        return y + x if getattr(self, "add", False) else y
+        y.extend(self.m(y[-1]) for _ in range(3))
+        return self.cv2(torch.cat(y, 1))
 
 
 class C1(nn.Module):
@@ -1070,15 +1066,7 @@ class C3k2(C2f):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(
-        self,
-        c1: int,
-        c2: int,
-        n: int = 1,
-        c3k: bool = False,
-        e: float = 0.5,
-        attn: bool = False,
-        g: int = 1,
-        shortcut: bool = True,
+        self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True
     ):
         """Initialize C3k2 module.
 
@@ -1088,21 +1076,12 @@ class C3k2(C2f):
             n (int): Number of blocks.
             c3k (bool): Whether to use C3k blocks.
             e (float): Expansion ratio.
-            attn (bool): Whether to use attention blocks.
             g (int): Groups for convolutions.
             shortcut (bool): Whether to use shortcut connections.
         """
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(
-            nn.Sequential(
-                Bottleneck(self.c, self.c, shortcut, g),
-                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
-            )
-            if attn
-            else C3k(self.c, self.c, 2, shortcut, g)
-            if c3k
-            else Bottleneck(self.c, self.c, shortcut, g)
-            for _ in range(n)
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
 
 
@@ -1170,8 +1149,6 @@ class RepVGGDW(torch.nn.Module):
 
         This method fuses the convolutional layers and updates the weights and biases accordingly.
         """
-        if not hasattr(self, "conv1"):
-            return  # already fused
         conv = fuse_conv_and_bn(self.conv.conv, self.conv.bn)
         conv1 = fuse_conv_and_bn(self.conv1.conv, self.conv1.bn)
 
@@ -1415,7 +1392,7 @@ class PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1))
+        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=self.c // 64)
         self.ffn = nn.Sequential(Conv(self.c, self.c * 2, 1), Conv(self.c * 2, self.c, 1, act=False))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1970,98 +1947,33 @@ class SAVPE(nn.Module):
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
+class EMA(nn.Module):
+    """Efficient Multi-Scale Attention (EMA) module."""
 
-class Proto26(Proto):
-    """Ultralytics YOLO26 models mask Proto module for segmentation models."""
+    def __init__(self, channels, n=1, factor=8):
+        super(EMA, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
 
-    def __init__(self, ch: tuple = (), c_: int = 256, c2: int = 32, nc: int = 80):
-        """Initialize the Ultralytics YOLO models mask Proto module with specified number of protos and masks.
-
-        Args:
-            ch (tuple): Tuple of channel sizes from backbone feature maps.
-            c_ (int): Intermediate channels.
-            c2 (int): Output channels (number of protos).
-            nc (int): Number of classes for semantic segmentation.
-        """
-        super().__init__(c_, c_, c2)
-        self.feat_refine = nn.ModuleList(Conv(x, ch[0], k=1) for x in ch[1:])
-        self.feat_fuse = Conv(ch[0], c_, k=3)
-        self.semseg = nn.Sequential(Conv(ch[0], c_, k=3), Conv(c_, c_, k=3), nn.Conv2d(c_, nc, 1))
-
-    def forward(self, x: torch.Tensor, return_semseg: bool = True) -> torch.Tensor:
-        """Perform a forward pass through layers using an upsampled input image."""
-        feat = x[0]
-        for i, f in enumerate(self.feat_refine):
-            up_feat = f(x[i + 1])
-            up_feat = F.interpolate(up_feat, size=feat.shape[2:], mode="nearest")
-            feat = feat + up_feat
-        p = super().forward(self.feat_fuse(feat))
-        if self.training and return_semseg:
-            semseg = self.semseg(feat)
-            return (p, semseg)
-        return p
-
-    def fuse(self):
-        """Fuse the model for inference by removing the semantic segmentation head."""
-        self.semseg = None
-
-
-class RealNVP(nn.Module):
-    """RealNVP: a flow-based generative model.
-
-    References:
-        https://arxiv.org/abs/1605.08803
-        https://github.com/open-mmlab/mmpose/blob/main/mmpose/models/utils/realnvp.py
-    """
-
-    @staticmethod
-    def nets():
-        """Get the scale model in a single invertable mapping."""
-        return nn.Sequential(nn.Linear(2, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 2), nn.Tanh())
-
-    @staticmethod
-    def nett():
-        """Get the translation model in a single invertable mapping."""
-        return nn.Sequential(nn.Linear(2, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 2))
-
-    @property
-    def prior(self):
-        """The prior distribution."""
-        return torch.distributions.MultivariateNormal(self.loc, self.cov)
-
-    def __init__(self):
-        super().__init__()
-
-        self.register_buffer("loc", torch.zeros(2))
-        self.register_buffer("cov", torch.eye(2))
-        self.register_buffer("mask", torch.tensor([[0, 1], [1, 0]] * 3, dtype=torch.float32))
-
-        self.s = torch.nn.ModuleList([self.nets() for _ in range(len(self.mask))])
-        self.t = torch.nn.ModuleList([self.nett() for _ in range(len(self.mask))])
-        self.init_weights()
-
-    def init_weights(self):
-        """Initialization model weights."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
-
-    def backward_p(self, x):
-        """Apply mapping form the data space to the latent space and calculate the log determinant of the Jacobian
-        matrix.
-        """
-        log_det_jacob, z = x.new_zeros(x.shape[0]), x
-        for i in reversed(range(len(self.t))):
-            z_ = self.mask[i] * z
-            s = self.s[i](z_) * (1 - self.mask[i])
-            t = self.t[i](z_) * (1 - self.mask[i])
-            z = (1 - self.mask[i]) * (z - t) * torch.exp(-s) + z_
-            log_det_jacob -= s.sum(dim=1)
-        return z, log_det_jacob
-
-    def log_prob(self, x):
-        """Calculate the log probability of given sample in data space."""
-        if x.dtype == torch.float32 and self.s[0][0].weight.dtype != torch.float32:
-            self.float()
-        z, log_det = self.backward_p(x)
-        return self.prior.log_prob(z) + log_det
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g, c//g, h, w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)

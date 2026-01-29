@@ -11,6 +11,8 @@ from .tasks import (
     parse_model,
     torch_safe_load,
     yaml_model_load,
+    WorldModel,
+    OBBModel,
 )
 
 __all__ = (
@@ -24,4 +26,5 @@ __all__ = (
     "parse_model",
     "torch_safe_load",
     "yaml_model_load",
+    "EMA",
 )
